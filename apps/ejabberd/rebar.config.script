@@ -8,23 +8,26 @@ DisableCoverage = fun() ->
                 end, CONFIG, Opts)
 end,
 
-GetERTSV = fun() ->
-    Path = filename:dirname(
-            filename:dirname(
-             filename:dirname(
-              filename:dirname(
-               code:which(kernel))))),
-    [ERTS_STR] = filelib:wildcard("erts-*", Path),
-    string:substr(ERTS_STR, 6, 3)
+GetFullVer = fun() ->
+    Path = filename:join([code:root_dir(), "releases",
+                          erlang:system_info(otp_release),
+                          "OTP_VERSION"]),
+    {ok, BinString} = file:read_file(Path),
+    case re:replace(BinString, <<"\\s+">>, "", [global]) of
+        Version when is_binary(Version) ->
+            Version;
+        [Version | _] ->
+            Version
+    end
 end,
 
 case erlang:system_info(otp_release) of
     "17" ->
-        case catch GetERTSV() of
-            "6.4" -> % This is 17.5 where cover was fixed
+        case catch GetFullVer() of
+            <<"17.5">> -> % This is 17.5 where cover was fixed
                 CONFIG;
             _ ->
-                io:format("disabling coverage for OTP 17~n"),
+                io:format("disabling coverage for OTP 17.0 to 17.4~n"),
                 DisableCoverage()
         end;
     _ ->
