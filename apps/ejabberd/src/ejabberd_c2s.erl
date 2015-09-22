@@ -48,7 +48,7 @@
          wait_for_stream/2,
          wait_for_auth/2,
          wait_for_feature_request/2,
-         wait_for_bind_or_resume/2,
+         wait_for_feature_request_after_auth/2,
          wait_for_session_or_sm/2,
          wait_for_sasl_response/2,
          session_established/2, session_established/3,
@@ -321,14 +321,16 @@ stream_start_features_before_auth(#state{server = Server} = S) ->
                    S#state{sasl_state = SASLState}).
 
 stream_start_features_before_bind(#state{server = Server} = S) ->
+    SockMod = (S#state.sockmod):get_sockmod(S#state.socket),
     Features = ( [#xmlel{name = <<"bind">>,
                          attrs = [{<<"xmlns">>, ?NS_BIND}]},
                   #xmlel{name = <<"session">>,
                          attrs = [{<<"xmlns">>, ?NS_SESSION}]}]
+                 ++ maybe_compress_feature(SockMod, S)
                  ++ maybe_roster_versioning_feature(Server)
                  ++ hook_enabled_features(Server) ),
     send_element(S, stream_features(Features)),
-    fsm_next_state(wait_for_bind_or_resume, S).
+    fsm_next_state(wait_for_feature_request_after_auth, S).
 
 maybe_roster_versioning_feature(Server) ->
     ejabberd_hooks:run_fold(roster_get_versioning_feature,
@@ -350,9 +352,8 @@ stream_features(FeatureElements) ->
 %% http://xmpp.org/rfcs/rfc6120.html#tls-rules-mtn
 determine_features(SockMod, #state{tls = TLS, tls_enabled = TLSEnabled,
                                    tls_required = TLSRequired,
-                                   server = Server} = S) ->
-    OtherFeatures = maybe_compress_feature(SockMod, S)
-                 ++ maybe_sasl_mechanisms(Server)
+                                   server = Server}) ->
+    OtherFeatures = maybe_sasl_mechanisms(Server)
                  ++ hook_enabled_features(Server),
     case can_use_tls(SockMod, TLS, TLSEnabled) of
         true ->
@@ -628,28 +629,6 @@ wait_for_feature_request({xmlstreamelement, El}, StateData) ->
                                            streamid = new_id(),
                                            tls_enabled = true
                                           });
-        {?NS_COMPRESS_BIN, <<"compress">>} when Zlib == true,
-                                                ((SockMod == gen_tcp) or
-                                                 (SockMod == tls)) ->
-            case xml:get_subtag(El, <<"method">>) of
-                false ->
-                    send_element(StateData, compress_setup_failed()),
-                    fsm_next_state(wait_for_feature_request, StateData);
-                Method ->
-                    case xml:get_tag_cdata(Method) of
-                        <<"zlib">> ->
-                            Socket = StateData#state.socket,
-                            ZlibSocket = (StateData#state.sockmod):compress(Socket, ZlibLimit,
-                                                                            xml:element_to_binary(compressed())),
-                            fsm_next_state(wait_for_stream,
-                                           StateData#state{socket = ZlibSocket,
-                                                           streamid = new_id()
-                                                          });
-                        _ ->
-                            send_element(StateData, compress_unsupported_method()),
-                            fsm_next_state(wait_for_feature_request, StateData)
-                    end
-            end;
         _ ->
             if
                 TLSRequired and not TLSEnabled ->
@@ -723,15 +702,33 @@ wait_for_sasl_response({xmlstreamerror, _}, StateData) ->
 wait_for_sasl_response(closed, StateData) ->
     {stop, normal, StateData}.
 
--spec wait_for_bind_or_resume(Item :: ejabberd:xml_stream_item(),
+-spec wait_for_feature_request_after_auth(Item :: ejabberd:xml_stream_item(),
                               State :: state()) -> fsm_return().
-wait_for_bind_or_resume({xmlstreamelement,
+wait_for_feature_request_after_auth({xmlstreamelement,
                          #xmlel{name = <<"enable">>} = El}, StateData) ->
-    maybe_unexpected_sm_request(wait_for_bind_or_resume, El, StateData);
-wait_for_bind_or_resume({xmlstreamelement,
+    maybe_unexpected_sm_request(wait_for_feature_request_after_auth, El, StateData);
+wait_for_feature_request_after_auth({xmlstreamelement,
+                        #xmlel{name = <<"compress">>, attrs = Attrs} = El}, StateData) ->
+    {Zlib, _ZlibLimit} = StateData#state.zlib,
+    SockMod = (StateData#state.sockmod):get_sockmod(StateData#state.socket),
+    case xml:get_attr_s(<<"xmlns">>, Attrs) of
+        ?NS_COMPRESS_BIN when Zlib == true,
+            ((SockMod == gen_tcp) or
+                (SockMod == tls)) ->
+            case xml:get_subtag(El, <<"method">>) of
+                false ->
+                    send_element(StateData, compress_setup_failed()),
+                    fsm_next_state(wait_for_feature_request_after_auth, StateData);
+                Method ->
+                    enable_compression(Method, StateData)
+            end;
+        _ ->
+            fsm_next_state(wait_for_feature_request_after_auth, StateData)
+    end;
+wait_for_feature_request_after_auth({xmlstreamelement,
                          #xmlel{name = <<"resume">>} = El}, StateData) ->
-    maybe_resume_session(wait_for_bind_or_resume, El, StateData);
-wait_for_bind_or_resume({xmlstreamelement, El}, StateData) ->
+    maybe_resume_session(wait_for_feature_request_after_auth, El, StateData);
+wait_for_feature_request_after_auth({xmlstreamelement, El}, StateData) ->
     case jlib:iq_query_info(El) of
         #iq{type = set, xmlns = ?NS_BIND, sub_el = SubEl} = IQ ->
             U = StateData#state.user,
@@ -747,7 +744,7 @@ wait_for_bind_or_resume({xmlstreamelement, El}, StateData) ->
                 error ->
                     Err = jlib:make_error_reply(El, ?ERR_BAD_REQUEST),
                     send_element(StateData, Err),
-                    fsm_next_state(wait_for_bind_or_resume, StateData);
+                    fsm_next_state(wait_for_feature_request_after_auth, StateData);
                 _ ->
                     JID = jlib:make_jid(U, StateData#state.server, R),
                     Res = IQ#iq{type = result,
@@ -761,25 +758,41 @@ wait_for_bind_or_resume({xmlstreamelement, El}, StateData) ->
                                    StateData#state{resource = R, jid = JID})
             end;
         _ ->
-            fsm_next_state(wait_for_bind_or_resume, StateData)
+            fsm_next_state(wait_for_feature_request_after_auth, StateData)
     end;
 
-wait_for_bind_or_resume(timeout, StateData) ->
+wait_for_feature_request_after_auth(timeout, StateData) ->
     {stop, normal, StateData};
 
-wait_for_bind_or_resume({xmlstreamend, _Name}, StateData) ->
+wait_for_feature_request_after_auth({xmlstreamend, _Name}, StateData) ->
     send_trailer(StateData),
     {stop, normal, StateData};
 
-wait_for_bind_or_resume({xmlstreamerror, _}, StateData) ->
+wait_for_feature_request_after_auth({xmlstreamerror, _}, StateData) ->
     send_element(StateData, ?INVALID_XML_ERR),
     send_trailer(StateData),
     {stop, normal, StateData};
 
-wait_for_bind_or_resume(closed, StateData) ->
+wait_for_feature_request_after_auth(closed, StateData) ->
     {stop, normal, StateData}.
 
--spec wait_for_session_or_sm(Item :: ejabberd:xml_stream_item(),
+enable_compression(Method, StateData) ->
+    {_Zlib, ZlibLimit} = StateData#state.zlib,
+    case xml:get_tag_cdata(Method) of
+        <<"zlib">> ->
+            Socket = StateData#state.socket,
+            ZlibSocket = (StateData#state.sockmod):compress(Socket, ZlibLimit,
+                xml:element_to_binary(compressed())),
+            fsm_next_state(wait_for_stream,
+                StateData#state{socket = ZlibSocket,
+                    streamid = new_id()
+                });
+        _ ->
+            send_element(StateData, compress_unsupported_method()),
+            fsm_next_state(wait_for_feature_request, StateData)
+    end.
+
+        -spec wait_for_session_or_sm(Item :: ejabberd:xml_stream_item(),
                              State :: state()) -> fsm_return().
 wait_for_session_or_sm({xmlstreamelement,
                         #xmlel{name = <<"enable">>} = El}, StateData) ->
@@ -2752,13 +2765,13 @@ do_resume_session(SMID, El, [{_, Pid}], StateData) ->
             ?WARNING_MSG("resumption error (invalid response from ~p)~n",
                          [Pid]),
             send_element(StateData, stream_mgmt_failed(<<"item-not-found">>)),
-            fsm_next_state(wait_for_bind_or_resume, StateData)
+            fsm_next_state(wait_for_feature_request_after_auth, StateData)
     end;
 
 do_resume_session(SMID, _El, [], StateData) ->
     ?WARNING_MSG("no previous session with stream id ~p~n", [SMID]),
     send_element(StateData, stream_mgmt_failed(<<"item-not-found">>)),
-    fsm_next_state(wait_for_bind_or_resume, StateData).
+    fsm_next_state(wait_for_feature_request_after_auth, StateData).
 
 merge_state(OldSD, SD) ->
     Preserve = [#state.jid,

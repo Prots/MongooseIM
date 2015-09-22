@@ -27,7 +27,7 @@
 
 -define(SECURE_USER, secure_joe).
 -define(CERT_FILE, "priv/ssl/fake_server.pem").
--define(TLS_VERSIONS, ["tlsv1", "tlsv1.1", "tlsv1.2"]).
+-define(TLS_VERSIONS, ["tlsv1"]).
 -define(NS_AUTH, <<"jabber:iq:auth">>).
 
 %%--------------------------------------------------------------------
@@ -41,9 +41,11 @@ all() ->
             {skip, "Conf reload doesn't work correctly with sample external auth"};
         _ ->
             [{group, negative},
+             {group, compression},
              {group, pre_xmpp_1_0},
              {group, starttls},
-             {group, tls}]
+             {group, tls}
+              ]
     end.
 
 groups() ->
@@ -51,7 +53,8 @@ groups() ->
                      invalid_stream_namespace]},
      {pre_xmpp_1_0, [], [pre_xmpp_1_0_stream]},
      {starttls, test_cases()},
-     {tls, generate_tls_vsn_tests()}].
+     {tls, generate_tls_vsn_tests()},
+     {compression, [negotiate_compression, fail_compression_before_auth]}].
 
 test_cases() ->
     generate_tls_vsn_tests() ++
@@ -103,6 +106,23 @@ generate_tls_vsn_tests() ->
 %%--------------------------------------------------------------------
 %% Tests
 %%--------------------------------------------------------------------
+
+negotiate_compression(Config) ->
+    %% given
+    Spec = escalus_users:get_userspec(Config, alice),
+    {ok, Conn, _, _} = escalus_connection:start(Spec, [{?MODULE, verify_compression_feature}]),
+    ok.
+
+fail_compression_before_auth(Config) ->
+    Spec = escalus_users:get_userspec(Config, alice),
+    try
+        {ok, _Conn, _, _} = escalus_connection:start(Spec, [{?MODULE, fail_compression_request}]),
+        ct:fail(compression_enabled)
+    catch
+        error:{badmatch, _} ->
+            ok
+    end,
+    ok.
 
 invalid_host(Config) ->
     %% given
@@ -240,6 +260,38 @@ connect_to_invalid_host(Conn, UnusedProps, UnusedFeatures) ->
     escalus:send(Conn, escalus_stanza:stream_start(<<"hopefullynonexistentdomain">>,
                                                    ?NS_JABBER_CLIENT)),
     {Conn, UnusedProps, UnusedFeatures}.
+
+verify_compression_feature(Conn, Props, UnusedFeatures) ->
+    escalus:send(Conn, escalus_stanza:stream_start(<<"localhost">>, ?NS_JABBER_CLIENT)),
+    StreamStartResponse = escalus:wait_for_stanza(Conn),
+    escalus:assert(is_stream_start, StreamStartResponse),
+    FeaturesStanza = escalus:wait_for_stanza(Conn),
+    escalus:assert(fun has_no_compression_feature/1, FeaturesStanza),
+    {M, F} = proplists:get_value(auth, Props, {escalus_auth, auth_plain}),
+    M:F(Conn, Props),
+    escalus_connection:reset_parser(Conn),
+    {_Props1, []} = escalus_session:start_stream(Conn, Props),
+    NextStanza = escalus:wait_for_stanza(Conn),
+    escalus:assert(fun has_compression_feature/1, NextStanza),
+    NewProps = [{compression, <<"zlib">>}|Props],
+    escalus_session:compress(Conn, NewProps),
+    {Conn, Props, UnusedFeatures}.
+
+has_no_compression_feature(FeaturesStanza) ->
+    case lists:keyfind(<<"compression">>, 2, FeaturesStanza#xmlel.children) of
+        false -> true;
+        _ -> false
+    end.
+
+has_compression_feature(FeaturesStanza) ->
+    not has_no_compression_feature(FeaturesStanza).
+
+fail_compression_request(Conn, Props, UnusedFeatures) ->
+    escalus:send(Conn, escalus_stanza:stream_start(<<"localhost">>, ?NS_JABBER_CLIENT)),
+    _Stanzas = escalus:wait_for_stanzas(Conn, 2),
+    NewProps = [{compression, <<"zlib">>}|Props],
+    escalus_session:compress(Conn, NewProps),
+    {Conn, Props, UnusedFeatures}.
 
 connect_with_invalid_stream_namespace(Spec) ->
     F = fun (Conn, UnusedProps, UnusedFeatures) ->
